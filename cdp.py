@@ -45,6 +45,7 @@ _requests: dict[str, dict] = {}
 _responses: dict[str, dict] = {}
 _failures: list[dict] = []
 _lock = threading.Lock()
+_ws_ready = threading.Event()  # 连接就绪同步事件
 _nav_done = threading.Event()
 _result_queue: queue.Queue = queue.Queue()
 _bg_loop: asyncio.AbstractEventLoop | None = None
@@ -163,6 +164,7 @@ def _run_loop(loop: asyncio.AbstractEventLoop, url: str):
     async def _connect_and_read():
         global _ws
         _ws = await websockets.connect(url, max_size=10**8)
+        _ws_ready.set()
         await _reader_loop()
 
     task = loop.create_task(_connect_and_read())
@@ -391,6 +393,7 @@ def interactive_loop(default_port: int):
                     _bg_loop.call_soon_threadsafe(_bg_loop.stop)
                     time.sleep(0.2)
                 _ws = None
+                _ws_ready.clear()
 
                 port = params.get("port", default_port)
                 cdp_host = start_chrome(port)
@@ -412,17 +415,17 @@ def interactive_loop(default_port: int):
                 bg_thread = threading.Thread(target=_run_loop, args=(_bg_loop, ws_url), daemon=True, name="bg_thread")
                 bg_thread.start()
 
-                # 等待连接建立
-                time.sleep(0.8)
-
-                # 主动开启 CDP 域，订阅页面和网络事件
-                async def enable_domains():
-                    if _ws:
-                        await _ws.send(json.dumps({"id": next(_cmd_id_counter), "method": "Network.enable", "params": {}}))
-                        await _ws.send(json.dumps({"id": next(_cmd_id_counter), "method": "Page.enable", "params": {}}))
-                schedule_coro(enable_domains())
-
-                result = {"ok": True, "ws_url": ws_url, "note": "connected and domains enabled"}
+                # 等待连接真正建立（由 _connect_and_read 内部的 _ws_ready.set() 触发）
+                if not _ws_ready.wait(timeout=5.0):
+                    result = {"ok": False, "error": "WebSocket connection timeout"}
+                else:
+                    # 主动开启 CDP 域，订阅页面和网络事件
+                    async def enable_domains():
+                        if _ws:
+                            await _ws.send(json.dumps({"id": next(_cmd_id_counter), "method": "Network.enable", "params": {}}))
+                            await _ws.send(json.dumps({"id": next(_cmd_id_counter), "method": "Page.enable", "params": {}}))
+                    schedule_coro(enable_domains())
+                    result = {"ok": True, "ws_url": ws_url, "note": "connected and domains enabled"}
 
             elif cmd == "disconnect":
                 # 彻底清理旧 bg_loop，防止僵尸 reader
@@ -447,21 +450,27 @@ def interactive_loop(default_port: int):
             elif cmd == "navigate":
                 if _bg_loop is None or _bg_loop.is_closed():
                     result = {"ok": False, "error": "bg_loop is dead, reconnect first"}
-                elif _ws is None:
-                    result = {"ok": False, "error": "WebSocket not connected, reconnect first"}
                 else:
-                    url = params.get("url", "")
-                    _nav_done.clear()
-                    async def do_nav():
-                        if _ws is None:
-                            raise RuntimeError("_ws is None during navigate")
-                        await _ws.send(json.dumps({
-                            "id": next(_cmd_id_counter),
-                            "method": "Page.navigate",
-                            "params": {"url": url}
-                        }))
-                    schedule_coro(do_nav())
-                    result = {"ok": True, "note": "navigate 已提交"}
+                    # 自愈：如果 _ws 瞬间为 None，极短时间重试
+                    for _ in range(5):
+                        if _ws is not None:
+                            break
+                        time.sleep(0.1)
+                    if _ws is None:
+                        result = {"ok": False, "error": "WebSocket not connected"}
+                    else:
+                        url = params.get("url", "")
+                        _nav_done.clear()
+                        async def do_nav():
+                            if _ws is None:
+                                raise RuntimeError("_ws is None during navigate")
+                            await _ws.send(json.dumps({
+                                "id": next(_cmd_id_counter),
+                                "method": "Page.navigate",
+                                "params": {"url": url}
+                            }))
+                        schedule_coro(do_nav())
+                        result = {"ok": True, "note": "navigate 已提交"}
 
             elif cmd == "wait_navigate":
                 timeout = params.get("timeout", 15)

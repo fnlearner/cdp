@@ -260,6 +260,31 @@ await _cdp_send_raw(...)  # 2. 再发命令（reader 已在跑，可以消费响
 
 **修复**：引入 `_nav_done = threading.Event()`，navigate 命令清除它，Page.loadEventFired 事件设置它，`wait_navigate` 命令等待它。
 
+### 10. `connect` 后固定 `sleep` 是竞态，后续命令失败
+
+**问题**：`connect` handler 启动 bg_thread 后 sleep 0.8s 就返回，但 bg_thread 里 `_ws` 的赋值发生在 `await websockets.connect()` 完成之后。启动时机不稳定时，0.8s 不够，导致后续 `navigate` 命令报 `"WebSocket not connected, reconnect first"`。
+
+**修复**：cdp_send 内部自己等 `_ws` 就绪，而不是靠外部固定 sleep。具体做法：cdp_send 在发命令前轮询检查 `_ws is not None`，最多等几秒。
+
+```python
+# ❌ 错误：靠固定 sleep 赌 ws 就绪
+time.sleep(0.8)
+result = {"ok": True}
+
+# ✅ 正确：cdp_send 自己等 ws 就绪
+def cdp_send(method, params=None):
+    if _ws is None:
+        for _ in range(50):  # 最多 5s
+            time.sleep(0.1)
+            if _ws is not None:
+                break
+        else:
+            raise RuntimeError("WebSocket 未在 5s 内就绪")
+    # 然后再发命令...
+```
+
+**根本原因**：bg_thread 的启动和 `_ws` 的赋值都在 bg_thread 内部，主线程无法可靠地预测何时完成。正确的跨线程同步是让消费者（cdp_send）自己等资源就绪，而不是让生产者（bg_thread）通知。
+
 ```python
 # navigate handler
 _nav_done.clear()
